@@ -15,12 +15,13 @@ print("Importing Tensorflow (with built-in Keras)")
 from tensorflow import keras
 import tensorflow as tf
 print("TF version is %s " %tf.__version__)
-
+import pandas
 import sklearn
 import sklearn.metrics
 import sklearn.ensemble
 import scipy.sparse
 import json
+from keras_models import *
 
 @numba.njit
 def fill_target_matrix(mat, blids):
@@ -339,21 +340,27 @@ def load_element_pairs(fn):
     fill_target_matrix(target_matrix, els_blid)
 
     #Fill the element pairs
-    elem_pairs_X = np.zeros((20000,5), dtype=np.float32)
-    elem_pairs_y = np.zeros((20000,1), dtype=np.float32)
+    elem_pairs_X = np.zeros((20000,5), dtype=np.float32) #el 1, eta1, el2, eta2, dEta?
+    elem_pairs_y = np.zeros((20000,1), dtype=np.float32) #truth
     n = fill_elem_pairs(elem_pairs_X, elem_pairs_y, els, dm, target_matrix, True)
-
-    elem_pairs_X = elem_pairs_X[:n]
+    elem_pairs_X = elem_pairs_X[:n] #strip last unneccessary rows
     elem_pairs_y = elem_pairs_y[:n]
-    
     return elem_pairs_X, elem_pairs_y
 
+def getModel_garnet(inputShape):
+  model = GarNetClusteringModel()
+  model.build(input_shape=(1,inputShape.shape[0],inputShape.shape[1])) #BxVxF: batch, vertices(==elements per event), features (pt,eta,phi)
+  print model
+  opt = keras.optimizers.Adam(lr=1e-3)
+  model.compile(loss="binary_crossentropy", optimizer=opt)
+  model.summary()
+  return 
 def getModel_baseline(inputShape):
   
   nunit = 256
   dropout = 0.2
   model = keras.models.Sequential()
-  model.add(keras.layers.Dense(nunit, input_shape=(inputShape, )))
+  model.add(keras.layers.Dense(nunit, input_shape=(inputShape.shape[1], )))
   
   model.add(keras.layers.LeakyReLU())
   model.add(keras.layers.Dropout(dropout))
@@ -390,14 +397,14 @@ def getModel_baseline(inputShape):
   
   return model
     
-def trainGarnet(infolder):
+def train(type,infolder):
   
   try:
       import setGPU
   except:
       print("Could not import setGPU, Nvidia device not found")
   
-  gpuFraction = 0.8
+  gpuFraction = 0.2
   gpu_options = tf.compat.v1.GPUOptions(per_process_gpu_memory_fraction=gpuFraction)
   sess = tf.compat.v1.Session(config=tf.compat.v1.ConfigProto(gpu_options=gpu_options))
   tf.compat.v1.keras.backend.set_session(sess)
@@ -413,16 +420,18 @@ def trainGarnet(infolder):
     for file in f:
       if 'ev' in file:
         files.append(os.path.join(r, file))
+        break
 
-  for fn in files:
-    print("Loading {0}".format(fn))
+  for i,fn in enumerate(files):
+    sys.stdout.write("\r" + "Loading file %i/%i"%(i,len(files)))
+    sys.stdout.flush()
     elem_pairs_X, elem_pairs_y = load_element_pairs(fn)
     all_elem_pairs_X += [elem_pairs_X]
     all_elem_pairs_y += [elem_pairs_y]
-  
+
   elem_pairs_X = np.vstack(all_elem_pairs_X)
   elem_pairs_y = np.vstack(all_elem_pairs_y)
-  
+
   shuf = np.random.permutation(range(len(elem_pairs_X)))
   elem_pairs_X = elem_pairs_X[shuf]
   elem_pairs_y = elem_pairs_y[shuf]
@@ -433,8 +442,12 @@ def trainGarnet(infolder):
   weights[elem_pairs_y[:, 0]==1] = 1.0/ns
   weights[elem_pairs_y[:, 0]==0] = 1.0/nb
   
-  model = getModel_baseline(elem_pairs_X.shape[1])
-  
+  modelname = 'garnet'
+  if type.find('baseline')!=-1:
+    modelname = 'clustering'
+    model = getModel_baseline(elem_pairs_X)
+  else:
+    model = getModel_garnet(elem_pairs_X)
   ntrain = int(0.8*len(elem_pairs_X))
   ret = model.fit(
       elem_pairs_X[:ntrain], elem_pairs_y[:ntrain, 0], sample_weight=weights[:ntrain],
@@ -444,6 +457,7 @@ def trainGarnet(infolder):
 
   pp = model.predict(elem_pairs_X, batch_size=10000)
   confusion = sklearn.metrics.confusion_matrix(elem_pairs_y[ntrain:, 0], pp[ntrain:]>0.5)
+  print("For %s" %modelname)
   print("Print confusion matrix:")
   print("[ [ True Pos     False Pos]")
   print("  [ False Neg    True Neg ] ]")
@@ -454,22 +468,94 @@ def trainGarnet(infolder):
       "val_loss": ret.history["val_loss"]
   }
 
-  with open("clustering.json", "w") as fi:
+  with open(modelname+".json", "w") as fi:
       json.dump(training_info, fi)
-  model.save("clustering.h5")
+  model.save(modelname+".h5")
+
+def getROCplot():
+	plt.clf()
+	plt.figure()
+	plt.xlim([0.05, 1.0])
+	plt.ylim([0.0001, 0.7])
+	plt.yscale('log')
+	plt.grid()
+	return plt
+      
+def doROC(infolder):
+  all_elem_pairs_X = []
+  all_elem_pairs_y = []
   
+  files = []
+  path = infolder
+  for r,d,f in os.walk(path):
+    for file in f:
+      if 'ev' in file:
+        files.append(os.path.join(r, file))
+
+  for fn in files:
+    elem_pairs_X, elem_pairs_y = load_element_pairs(fn)
+    all_elem_pairs_X += [elem_pairs_X]
+    all_elem_pairs_y += [elem_pairs_y]
   
+  elem_pairs_X = np.vstack(all_elem_pairs_X)
+  elem_pairs_y = np.vstack(all_elem_pairs_y)
+  
+  shuf = np.random.permutation(range(len(elem_pairs_X)))
+  elem_pairs_X = elem_pairs_X[shuf]
+  elem_pairs_y = elem_pairs_y[shuf]
+  ntrain = int(0.8*len(elem_pairs_X))
+  model = getModel_baseline(elem_pairs_X.shape[1])
+  weightfiles = ['/afs/cern.ch/user/t/thaarres/public/pfstudies/clustering.h5','/eos/user/j/jpata/particleflow/clustering.h5']  
+  colors = ['#377eb8', '#ff7f00', '#4daf4a','#f781bf', '#a65628', '#984ea3','#999999', '#e41a1c', '#dede00']
+  model_names = ["GarNet","Baseline"]
+  
+  line_styles = ["solid", ":", "-."] * 30
+  rocplt = getROCplot()
+  
+  for model_name, weightfile in zip(model_names,weightfiles):
+    print("Loading weights for model %s" %model_name)
+    # Loads the weights
+    model.load_weights(weightfile)
+
+    # Re-evaluate the model  
+    # pp = model.predict(elem_pairs_X, batch_size=10000)
+#     confusion = sklearn.metrics.confusion_matrix(elem_pairs_y[ntrain:, 0], pp[ntrain:]>0.5)
+#     print("Print confusion matrix:")
+#     print("[ [ True Pos     False Pos]")
+#     print("  [ False Neg    True Neg ] ]")
+#     print(confusion)
+#     print(model.metrics_names)
+#     loss = model.evaluate(elem_pairs_X,elem_pairs_y, batch_size=10000)
+#     print("Restored model, loss: {:5.2f}".format(loss ))
+  
+    from sklearn.metrics import roc_curve,roc_auc_score
+  
+    y_val_cat_prob=model.predict_proba(elem_pairs_X)
+    fpr , tpr , thresholds = roc_curve ( elem_pairs_y , y_val_cat_prob)  
+  
+    AOC = roc_auc_score(elem_pairs_y , y_val_cat_prob)
+    print("AOC: {0}".format(AOC))
+  
+    fpr[fpr < 0.0001] = 0.0001
+    rocplt.plot(tpr, fpr, color=colors.pop(0), lw=1, label='{0} (area = {1:.2f})'.format(model_name, AOC))
+  
+  rocplt.legend(loc="lower right")
+  rocplt.savefig("ROC.png")
         
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-g', '--doInputGraphs', action='store_true')
+    parser.add_argument('-r', '--doROC', action='store_true')
+    parser.add_argument('-m', dest='model', type=str, default='garnet')
     parser.add_argument('-o', dest='output', type=str, default='data/')
     parser.add_argument('-i', dest='input', type=str, default="/eos/user/j/jpata/particleflow/TTbar/191009_155100/")
     args = parser.parse_args()
     if args.doInputGraphs:
       print("Building input graphs and saving to %s" %args.output)
       build_input_graph(args.input,args.output)
-    else:
-      print("Opening .npz files in %s and training network" %args.output)
-      trainGarnet(args.output)
+    elif args.doROC:
+      doROC(args.output)
+    else:  
+      print("Opening .npz files in %s and training network %s" %(args.output, args.model ))
+      train(args.model,args.output)
